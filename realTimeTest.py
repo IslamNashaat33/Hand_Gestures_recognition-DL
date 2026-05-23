@@ -1,14 +1,42 @@
+import os
+from collections import Counter, deque
+
 import cv2
 import numpy as np
-import mediapipe as mp
+
+try:
+    import mediapipe as mp
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision
+except ImportError as exc:
+    raise ImportError(
+        "mediapipe is not installed in the active environment. "
+        "Install it with: pip install mediapipe"
+    ) from exc
+
 from tensorflow.keras.models import load_model
-from collections import deque, Counter
 
 # ==========================
 # Load trained model
 # ==========================
 
-model = load_model("hand_gesture_model.h5")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+GESTURE_MODEL_PATH = os.path.join(BASE_DIR, "hand_gesture_model.h5")
+HAND_LANDMARKER_MODEL_PATH = os.path.join(BASE_DIR, "hand_landmarker.task")
+
+if not os.path.exists(GESTURE_MODEL_PATH):
+    raise FileNotFoundError(
+        f"Gesture model not found: {GESTURE_MODEL_PATH}"
+    )
+
+if not os.path.exists(HAND_LANDMARKER_MODEL_PATH):
+    raise FileNotFoundError(
+        "Hand Landmarker model not found: "
+        f"{HAND_LANDMARKER_MODEL_PATH}. Download the .task model and place it "
+        "next to this script."
+    )
+
+model = load_model(GESTURE_MODEL_PATH)
 
 # IMPORTANT:
 # Must match train_data.class_indices order
@@ -28,6 +56,30 @@ class_names = [
 
 IMG_SIZE = 224
 
+HAND_CONNECTIONS = [
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 4),
+    (0, 5),
+    (5, 6),
+    (6, 7),
+    (7, 8),
+    (5, 9),
+    (9, 10),
+    (10, 11),
+    (11, 12),
+    (9, 13),
+    (13, 14),
+    (14, 15),
+    (15, 16),
+    (13, 17),
+    (17, 18),
+    (18, 19),
+    (19, 20),
+    (0, 17),
+]
+
 # ==========================
 # Smoothing settings
 # ==========================
@@ -44,15 +96,38 @@ CONFIDENCE_THRESHOLD = 0.80
 # MediaPipe setup
 # ==========================
 
-mp_hands = mp.solutions.hands
-mp_draw = mp.solutions.drawing_utils
+BaseOptions = mp_python.BaseOptions
+HandLandmarker = vision.HandLandmarker
+HandLandmarkerOptions = vision.HandLandmarkerOptions
+VisionRunningMode = vision.RunningMode
 
-hands_detector = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=1,
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.7
+hand_landmarker_options = HandLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path=HAND_LANDMARKER_MODEL_PATH),
+    running_mode=VisionRunningMode.IMAGE,
+    num_hands=1,
+    min_hand_detection_confidence=0.7,
+    min_hand_presence_confidence=0.7,
+    min_tracking_confidence=0.7,
 )
+
+hand_landmarker = HandLandmarker.create_from_options(hand_landmarker_options)
+
+
+def draw_hand_landmarks(frame, landmarks):
+    points = []
+    height, width, _ = frame.shape
+
+    for landmark in landmarks:
+        x_coord = int(landmark.x * width)
+        y_coord = int(landmark.y * height)
+        points.append((x_coord, y_coord))
+        cv2.circle(frame, (x_coord, y_coord), 4, (255, 0, 0), -1)
+
+    for start_index, end_index in HAND_CONNECTIONS:
+        if start_index < len(points) and end_index < len(points):
+            cv2.line(frame, points[start_index], points[end_index], (0, 255, 0), 2)
+
+    return points
 
 # ==========================
 # Webcam
@@ -60,175 +135,157 @@ hands_detector = mp_hands.Hands(
 
 cap = cv2.VideoCapture(0)
 
-while True:
+if not cap.isOpened():
+    raise RuntimeError("Could not open webcam at index 0.")
 
-    ret, frame = cap.read()
+try:
+    while True:
 
-    if not ret:
-        break
+        ret, frame = cap.read()
 
-    frame = cv2.flip(frame, 1)
+        if not ret:
+            break
 
-    h, w, _ = frame.shape
+        frame = cv2.flip(frame, 1)
 
-    rgb = cv2.cvtColor(
-        frame,
-        cv2.COLOR_BGR2RGB
-    )
+        h, w, _ = frame.shape
 
-    results = hands_detector.process(rgb)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        results = hand_landmarker.detect(mp_image)
 
-    final_prediction = "No Hand"
+        final_prediction = "No Hand"
 
-    if results.multi_hand_landmarks:
+        if results.hand_landmarks:
 
-        hand_landmarks = results.multi_hand_landmarks[0]
+            hand_landmarks = results.hand_landmarks[0]
+            points = draw_hand_landmarks(frame, hand_landmarks)
 
-        # Draw landmarks
+            # ======================
+            # Bounding box
+            # ======================
 
-        mp_draw.draw_landmarks(
+            x = [point[0] for point in points]
+            y = [point[1] for point in points]
+
+            padding = 20
+
+            x_min = max(min(x) - padding, 0)
+            x_max = min(max(x) + padding, w)
+
+            y_min = max(min(y) - padding, 0)
+            y_max = min(max(y) + padding, h)
+
+            cv2.rectangle(
+                frame,
+                (x_min, y_min),
+                (x_max, y_max),
+                (0, 255, 0),
+                2
+            )
+
+            # ======================
+            # Crop hand from RGB
+            # ======================
+
+            hand_img = rgb[
+                y_min:y_max,
+                x_min:x_max
+            ]
+
+            if hand_img.size != 0:
+
+                # ======================
+                # Preprocess
+                # ======================
+
+                img = cv2.resize(
+                    hand_img,
+                    (IMG_SIZE, IMG_SIZE)
+                )
+
+                img = img.astype(np.float32) / 255.0
+
+                img = np.expand_dims(img, axis=0)
+
+                # ======================
+                # Prediction (fast path)
+                # ======================
+
+                pred = model.predict_on_batch(img)
+
+                confidence = float(np.max(pred))
+
+                class_index = int(np.argmax(pred))
+
+                # ======================
+                # Confidence threshold
+                # ======================
+
+                if confidence >= CONFIDENCE_THRESHOLD:
+
+                    current_gesture = class_names[class_index]
+
+                    # Append to smoothing window
+                    prediction_history.append(current_gesture)
+
+                    # ======================
+                    # Gesture smoothing
+                    # (majority vote over window)
+                    # ======================
+
+                    smoothed_prediction = Counter(
+                        prediction_history
+                    ).most_common(1)[0][0]
+
+                    final_prediction = (
+                        f"{smoothed_prediction} "
+                        f"{confidence * 100:.1f}%"
+                    )
+
+                else:
+                    # Below confidence threshold —
+                    # show that a hand is detected
+                    # but gesture is uncertain
+                    final_prediction = (
+                        f"Uncertain "
+                        f"{confidence * 100:.1f}%"
+                    )
+
+        else:
+            # No hand detected — clear history
+            # so stale predictions don't persist
+            prediction_history.clear()
+
+        # ==========================
+        # Display text
+        # ==========================
+
+        cv2.putText(
             frame,
-            hand_landmarks,
-            mp_hands.HAND_CONNECTIONS
-        )
-
-        # ======================
-        # Bounding box
-        # ======================
-
-        x = [
-            int(lm.x * w)
-            for lm in hand_landmarks.landmark
-        ]
-
-        y = [
-            int(lm.y * h)
-            for lm in hand_landmarks.landmark
-        ]
-
-        padding = 20
-
-        x_min = max(min(x) - padding, 0)
-        x_max = min(max(x) + padding, w)
-
-        y_min = max(min(y) - padding, 0)
-        y_max = min(max(y) + padding, h)
-
-        cv2.rectangle(
-            frame,
-            (x_min, y_min),
-            (x_max, y_max),
+            final_prediction,
+            (30, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
             (0, 255, 0),
             2
         )
 
-        # ======================
-        # Crop hand from RGB
-        # ======================
+        cv2.imshow(
+            "Hand Gesture Recognition",
+            frame
+        )
 
-        hand_img = rgb[
-            y_min:y_max,
-            x_min:x_max
-        ]
+        # Press Q to quit
 
-        if hand_img.size != 0:
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-            # ======================
-            # Preprocess
-            # ======================
-
-            img = cv2.resize(
-                hand_img,
-                (IMG_SIZE, IMG_SIZE)
-            )
-
-            img = img.astype(
-                np.float32
-            ) / 255.0
-
-            img = np.expand_dims(
-                img,
-                axis=0
-            )
-
-            # ======================
-            # Prediction (fast path)
-            # ======================
-
-            pred = model.predict_on_batch(img)
-
-            confidence = float(np.max(pred))
-
-            class_index = int(np.argmax(pred))
-
-            # ======================
-            # Confidence threshold
-            # ======================
-
-            if confidence >= CONFIDENCE_THRESHOLD:
-
-                current_gesture = class_names[class_index]
-
-                # Append to smoothing window
-                prediction_history.append(
-                    current_gesture
-                )
-
-                # ======================
-                # Gesture smoothing
-                # (majority vote over window)
-                # ======================
-
-                smoothed_prediction = Counter(
-                    prediction_history
-                ).most_common(1)[0][0]
-
-                final_prediction = (
-                    f"{smoothed_prediction} "
-                    f"{confidence * 100:.1f}%"
-                )
-
-            else:
-                # Below confidence threshold —
-                # show that a hand is detected
-                # but gesture is uncertain
-                final_prediction = (
-                    f"Uncertain "
-                    f"{confidence * 100:.1f}%"
-                )
-
-    else:
-        # No hand detected — clear history
-        # so stale predictions don't persist
-        prediction_history.clear()
-
+finally:
     # ==========================
-    # Display text
+    # Cleanup
     # ==========================
 
-    cv2.putText(
-        frame,
-        final_prediction,
-        (30, 50),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1,
-        (0, 255, 0),
-        2
-    )
-
-    cv2.imshow(
-        "Hand Gesture Recognition",
-        frame
-    )
-
-    # Press Q to quit
-
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-# ==========================
-# Cleanup
-# ==========================
-
-cap.release()
-cv2.destroyAllWindows()
+    cap.release()
+    hand_landmarker.close()
+    cv2.destroyAllWindows()

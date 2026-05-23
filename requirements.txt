@@ -1,6 +1,14 @@
+<<<<<<< HEAD
 mediapipe==0.10.14
 tensorflow==2.16.1
 protobuf==4.25.3
 numpy<2
 ml-dtypes==0.3.1
 opencv-contrib-python==4.11.0.86
+=======
+opencv-python
+numpy
+mediapipe
+tensorflow
+matplotlib
+>>>>>>> 85449f0c989d0af74d671a512aae8e9528392162
